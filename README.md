@@ -7,7 +7,7 @@ Run ComfyUI with the MOSS image on [Modal](https://modal.com) and access it thro
 ## Requirements
 
 - A [Modal](https://modal.com) account
-- Python 3.9 or newer
+- Python 3.10 or newer
 
 ## Installation
 
