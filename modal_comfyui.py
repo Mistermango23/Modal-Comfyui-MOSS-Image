@@ -63,9 +63,13 @@ REFRESH = os.getenv("COMFY_UPDATE", "0")
 # e.g. "janedoe/My-MOSS-Image-Loras". While it still holds the placeholder below
 # (or is empty), the LoRA download is skipped. Private repos work too, because
 # your Hugging Face token (secret "huggingface-secret") is used.
+# The repo is re-synced every time ComfyUI starts, so LoRAs you add or update on
+# Hugging Face appear after a restart (no image rebuild). Files you DELETE from
+# the repo are not removed from the volume.
 USER_LORAS_REPO = "yourusername/your-MOSS-Image-Loras"
 USER_LORAS_PLACEHOLDER = "yourusername/your-MOSS-Image-Loras"
 
+# You can swap the GPU for an L40S, A100, H100, or something else.
 GPU_TYPE = os.getenv("MODAL_GPU", "l40s")
 PORT = 8188
 
@@ -213,6 +217,31 @@ COMMON = dict(
 )
 
 
+def refresh_user_loras():
+    """Sync your own LoRA repo from Hugging Face on every start, so new or
+    changed LoRAs show up without rebuilding the image. `hf download` only
+    fetches files that changed, so it's quick when nothing is new."""
+    if not USER_LORAS_REPO or USER_LORAS_REPO == USER_LORAS_PLACEHOLDER:
+        return
+    target = "/vol/models/loras/My-MOSS-Image-Loras"
+    os.makedirs(target, exist_ok=True)
+    print(f"Syncing LoRAs from {USER_LORAS_REPO} ...")
+    try:
+        r = subprocess.run(
+            ["hf", "download", USER_LORAS_REPO, "--local-dir", target],
+            timeout=600,
+        )
+        if r.returncode != 0:
+            print(f"!! LoRA sync failed (exit {r.returncode}); using the LoRAs already on the volume.")
+        else:
+            try:
+                volume.commit()  # keep the new files so the next start only checks for changes
+            except Exception as e:
+                print(f"volume.commit() skipped: {e}")
+    except Exception as e:  # never block ComfyUI from starting because of this
+        print(f"!! LoRA sync error: {e}; using the LoRAs already on the volume.")
+
+
 def update_all():
     """Quick, temporary update: `git pull` ComfyUI and every custom node, then
     reinstall their requirements with torch pinned. Lost when the container stops."""
@@ -249,6 +278,8 @@ def launch_comfy() -> subprocess.Popen:
 
     # Guard against a dangling models symlink if the volume is empty.
     os.makedirs("/vol/models", exist_ok=True)
+
+    refresh_user_loras()
 
     if os.environ.get("COMFY_GIT_PULL") == "1":
         update_all()
