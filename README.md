@@ -28,7 +28,7 @@ pip install modal --upgrade
 Link the Modal CLI with your account (this opens a browser window for authentication):
 
 ```bash
-modal setup
+modal setup or python -m modal setup
 ```
 
 ## Usage
