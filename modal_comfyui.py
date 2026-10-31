@@ -70,6 +70,7 @@ REFRESH = os.getenv("COMFY_UPDATE", "0")
 USER_LORAS_REPO = "yourusername/your-MOSS-Image-Loras"
 USER_LORAS_PLACEHOLDER = "yourusername/your-MOSS-Image-Loras"
 
+# You can swap the GPU for an L40S, A100, H100, or something else.
 GPU_TYPE = os.getenv("MODAL_GPU", "l40s")
 PORT = 8188
 
