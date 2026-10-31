@@ -1,4 +1,5 @@
 import os
+import shlex
 import socket
 import subprocess
 import time
@@ -14,6 +15,7 @@ import modal
 #   COMFY_ONLY_NODES=a,b,c            start with ONLY these node folders enabled
 #                                     (e.g. ComfyUI-KJNodes,rgthree-comfy)
 #   COMFY_NO_MMAP=1                   load model files into RAM instead of mmap
+#   COMFY_GIT_PULL=0                  do NOT auto-update on start (default: update)
 # Environment variables of your local shell do NOT reach the container by
 # themselves, so they are forwarded explicitly (see `debug_env` below).
 DEBUG_VARS = ("COMFY_SAFE", "COMFY_ONLY_NODES", "COMFY_NO_MMAP", "COMFY_GIT_PULL")
@@ -25,21 +27,20 @@ debug_env = {k: os.environ[k] for k in DEBUG_VARS if os.environ.get(k)}
 PERSIST_USER_DATA = False
 
 # ---------------------------------------------------------------------------
-# HOW TO UPDATE ComfyUI and the custom nodes
+# HOW UPDATES WORK (ComfyUI + custom nodes)
 # ---------------------------------------------------------------------------
-# The ComfyUI + node code is baked into the image, and Modal caches image
-# layers, so a normal restart does NOT fetch new versions. Two ways to update:
+# AUTOMATIC (default): every time a container starts, ComfyUI and ALL custom
+# nodes are `git pull`ed to their latest commit. Requirements are reinstalled
+# only for repos that actually changed (torch stays pinned), so a start with
+# nothing new is quick. These updates live in the running container; the next
+# start pulls again, so you always get the newest version.
 #
-# 1) Permanent (recommended): rebuild the image with fresh `git clone`s by
-#    setting COMFY_UPDATE to a NEW value (a date works) before starting.
-#    Torch is deliberately kept cached so the working CUDA build isn't touched.
-#    After the update works, keep using that same value so the new image stays
-#    cached. To roll back, set the previous value again (or unset it).
+# BAKE INTO THE IMAGE (optional, makes starts faster after many updates):
+# set COMFY_UPDATE to a NEW value (a date works) to rebuild the image with
+# fresh clones. Torch stays cached so the working CUDA build isn't touched.
 #
-# 2) Quick test (temporary): COMFY_GIT_PULL=1 runs `git pull` inside the running
-#    container for ComfyUI and every custom node and reinstalls their
-#    requirements (torch stays pinned). Changes are lost when the container
-#    stops, and startup takes longer.
+# FREEZE (optional): set COMFY_GIT_PULL=0 to skip the automatic pull and run
+# exactly what is in the image (useful if an update breaks something).
 #
 # Windows commands (the script itself runs on Modal's Linux machines; only the
 # commands below depend on your local terminal):
@@ -69,7 +70,6 @@ REFRESH = os.getenv("COMFY_UPDATE", "0")
 USER_LORAS_REPO = "yourusername/your-MOSS-Image-Loras"
 USER_LORAS_PLACEHOLDER = "yourusername/your-MOSS-Image-Loras"
 
-# You can swap the GPU for an L40S, A100, H100, or something else.
 GPU_TYPE = os.getenv("MODAL_GPU", "l40s")
 PORT = 8188
 
@@ -243,29 +243,67 @@ def refresh_user_loras():
 
 
 def update_all():
-    """Quick, temporary update: `git pull` ComfyUI and every custom node, then
-    reinstall their requirements with torch pinned. Lost when the container stops."""
+    """Update ComfyUI and every custom node to the latest commit.
+
+    Shallow clones: fetch the remote's current HEAD and reset to it. Requirements
+    are reinstalled only for repos whose commit actually changed, with torch
+    pinned so the CUDA build can't be replaced. Never blocks startup: any
+    failure is printed and the existing code is used."""
     import glob
+    from concurrent.futures import ThreadPoolExecutor
 
-    repos = ["/root/ComfyUI"] + sorted(glob.glob("/root/ComfyUI/custom_nodes/*/"))
-    for repo in repos:
-        if not os.path.isdir(os.path.join(repo, ".git")):
-            continue
-        # Shallow clones: fetch the remote's current HEAD and fast-forward to it.
-        r = subprocess.run(
-            f"git -C {repo} fetch --depth 1 origin HEAD && git -C {repo} reset --hard FETCH_HEAD "
-            f"&& git -C {repo} submodule update --init --recursive --depth 1",
-            shell=True, capture_output=True, text=True,
-        )
-        status = "updated" if r.returncode == 0 else f"FAILED: {r.stderr.strip()[-200:]}"
-        print(f"[git pull] {repo}: {status}")
+    comfy = "/root/ComfyUI"
+    repos = [comfy] + [os.path.normpath(p) for p in sorted(glob.glob(f"{comfy}/custom_nodes/*/"))]
+    repos = [r for r in repos if os.path.isdir(os.path.join(r, ".git"))]
 
-    # Same torch-protecting install as at build time.
-    subprocess.run(
-        "for f in /root/ComfyUI/requirements.txt /root/ComfyUI/custom_nodes/*/requirements.txt; do "
-        'echo "== $f"; pip install -c /tmp/constraints.txt -r "$f" || echo "!! FAILED: $f"; done',
-        shell=True,
-    )
+    def sync(repo):
+        q = shlex.quote(repo)
+        try:
+            before = subprocess.run(f"git -C {q} rev-parse HEAD", shell=True,
+                                    capture_output=True, text=True, timeout=30).stdout.strip()
+            r = subprocess.run(
+                f"git -C {q} fetch --depth 1 origin HEAD && git -C {q} reset --hard FETCH_HEAD "
+                f"&& git -C {q} submodule update --init --recursive --depth 1",
+                shell=True, capture_output=True, text=True, timeout=240,
+            )
+            if r.returncode != 0:
+                return repo, False, f"FAILED: {r.stderr.strip()[-200:]}"
+            after = subprocess.run(f"git -C {q} rev-parse HEAD", shell=True,
+                                   capture_output=True, text=True, timeout=30).stdout.strip()
+            return repo, before != after, ("updated" if before != after else "already latest")
+        except Exception as e:
+            return repo, False, f"FAILED: {e}"
+
+    print(f"Updating {len(repos)} repos (ComfyUI + custom nodes) ...")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(sync, repos))
+    changed = set()
+    for repo, did_change, status in results:
+        print(f"[update] {os.path.basename(repo)}: {status}")
+        if did_change:
+            changed.add(repo)
+
+    def write_constraints(pattern, path):
+        subprocess.run(f"pip freeze | grep -iE '{pattern}' > {path}; true", shell=True)
+
+    def pip_reqs(repo, constraints):
+        req = os.path.join(repo, "requirements.txt")
+        if not os.path.isfile(req):
+            return
+        print(f"== pip install -r {req}")
+        if subprocess.run(["pip", "install", "-c", constraints, "-r", req]).returncode != 0:
+            print(f"!! FAILED: {req}")
+
+    # ComfyUI first. Only torch is pinned here, so ComfyUI's own packages
+    # (frontend, templates, ...) are allowed to move to the versions it needs.
+    if comfy in changed:
+        write_constraints("^(torch|torchvision|torchaudio)==", "/tmp/c_torch.txt")
+        pip_reqs(comfy, "/tmp/c_torch.txt")
+
+    # Then the nodes, with torch AND ComfyUI's (possibly just-updated) packages pinned.
+    write_constraints("^(torch|torchvision|torchaudio|comfyui[-_a-z0-9]*)==", "/tmp/c_all.txt")
+    for repo in sorted(changed - {comfy}):
+        pip_reqs(repo, "/tmp/c_all.txt")
 
 
 def launch_comfy() -> subprocess.Popen:
@@ -281,8 +319,12 @@ def launch_comfy() -> subprocess.Popen:
 
     refresh_user_loras()
 
-    if os.environ.get("COMFY_GIT_PULL") == "1":
-        update_all()
+    # Update on every start unless explicitly frozen with COMFY_GIT_PULL=0.
+    if os.environ.get("COMFY_GIT_PULL", "1") != "0":
+        try:
+            update_all()
+        except Exception as e:  # never block ComfyUI from starting
+            print(f"!! update failed, using the code in the image: {e}")
 
     cmd = ["python", "main.py", "--listen", "0.0.0.0", "--port", str(PORT)]
 
@@ -309,7 +351,7 @@ def launch_comfy() -> subprocess.Popen:
     # Popen (NOT subprocess.run): the caller must get control back once the
     # server is up.
     proc = subprocess.Popen(cmd, cwd="/root/ComfyUI")
-    wait_for_server(proc, PORT, timeout=570)
+    wait_for_server(proc, PORT, timeout=840)
     return proc
 
 
@@ -322,7 +364,7 @@ def launch_comfy() -> subprocess.Popen:
 # ComfyUI page opens a long-lived websocket plus dozens of parallel asset
 # requests, so they would queue behind it -> blank/slow page.
 @modal.concurrent(max_inputs=100)
-@modal.web_server(PORT, startup_timeout=600)
+@modal.web_server(PORT, startup_timeout=900)
 def run():
     launch_comfy()
 
